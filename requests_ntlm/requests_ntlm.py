@@ -1,11 +1,13 @@
 import binascii
 import sys
 import warnings
+import socket
 
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.exceptions import UnsupportedAlgorithm
+from httplib import HTTPConnection
 from ntlm_auth import ntlm
 from requests.auth import AuthBase
 from requests.packages.urllib3.response import HTTPResponse
@@ -137,6 +139,62 @@ class HttpNtlmAuth(AuthBase):
 
         return response3
 
+    def httplib_retry_using_http_NTLM_auth(self, auth_header_field, auth_header,
+                                           connection, response, auth_type):
+        """Attempt to authenticate using HTTP NTLM challenge/response."""
+        if auth_header in response.msg.dict:
+            return response
+
+        # Consume content to allow our new request to reuse the same connection.
+        response._safe_read(response.length)
+
+        # ntlm returns the headers as a base64 encoded bytestring. Convert to
+        # a string.
+        context = ntlm.Ntlm(ntlm_compatibility=self.ntlm_compatibility)
+        negotiate_message = context.create_negotiate_message(self.domain).decode('ascii')
+        auth = u'%s %s' % (auth_type, negotiate_message)
+        connection._tunnel_headers[auth_header] = auth
+        response2 = connection._tunnel_no_close()
+
+        # Consume content to allow our new request to reuse the same connection.
+        response2._safe_read(response2.length)
+
+        # this is important for some web applications that store
+        # authentication-related info in cookies (it took a long time to
+        # figure out)
+        if response2.msg.dict.get('set-cookie'):
+            connection._tunnel_headers['Cookie'] = response2.msg.dict.get('set-cookie')
+
+        # get the challenge
+        auth_header_value = response2.msg.dict[auth_header_field]
+
+        auth_strip = auth_type + ' '
+
+        ntlm_header_value = next(
+            s for s in (val.lstrip() for val in auth_header_value.split(','))
+            if s.startswith(auth_strip)
+        ).strip()
+
+        # Parse the challenge in the ntlm context
+        context.parse_challenge_message(ntlm_header_value[len(auth_strip):])
+
+        # build response
+        # Get the response based on the challenge message
+        authenticate_message = context.create_authenticate_message(
+            self.username,
+            self.password,
+            self.domain
+        )
+        authenticate_message = authenticate_message.decode('ascii')
+        auth = u'%s %s' % (auth_type, authenticate_message)
+        connection._tunnel_headers[auth_header] = auth
+        response3 = connection._tunnel_no_close()
+
+        # Get the session_security object created by ntlm-auth for signing and sealing of messages
+        self.session_security = context.session_security
+
+        return response3
+
     def response_hook(self, r, **kwargs):
         """The actual hook handler."""
         if r.status_code == 401:
@@ -165,6 +223,38 @@ class HttpNtlmAuth(AuthBase):
                     r,
                     auth_type,
                     kwargs
+                )
+
+        return r
+
+    def httplib_response_hook(self, conn, r):
+        """The actual hook handler."""
+        if r.status == 401:
+            # Handle server auth.
+            www_authenticate = r.msg.dict.get('www-authenticate', '').lower()
+            auth_type = _auth_type_from_header(www_authenticate)
+
+            if auth_type is not None:
+                return self.httplib_retry_using_http_NTLM_auth(
+                    'www-authenticate',
+                    'Authorization',
+                    conn,
+                    r,
+                    auth_type
+                )
+        elif r.status == 407:
+            # If we didn't have server auth, do proxy auth.
+            proxy_authenticate = r.msg.dict.get(
+                'proxy-authenticate', ''
+            ).lower()
+            auth_type = _auth_type_from_header(proxy_authenticate)
+            if auth_type is not None:
+                return self.httplib_retry_using_http_NTLM_auth(
+                    'proxy-authenticate',
+                    'Proxy-authorization',
+                    conn,
+                    r,
+                    auth_type
                 )
 
         return r
@@ -205,12 +295,45 @@ class HttpNtlmAuth(AuthBase):
         else:
             return None
 
+    def _monkey_patch_httplib(self):
+        def _tunnel_no_close(cls):
+            cls.send("CONNECT %s:%d HTTP/1.0\r\n" % (cls._tunnel_host,
+                                                     cls._tunnel_port))
+            for header, value in cls._tunnel_headers.iteritems():
+                cls.send("%s: %s\r\n" % (header, value))
+            cls.send("\r\n")
+            response = cls.response_class(cls.sock, strict=cls.strict,
+                                          method=cls._method)
+            response.begin()
+            return response
+
+        def _challenge_response_tunnel(cls):
+            cls._tunnel_headers["Connection"] = "Keep-Alive"
+            response = cls._tunnel_no_close()
+            response = self.httplib_response_hook(cls, response)
+
+            if response.version == 9:
+                # HTTP/0.9 doesn't support the CONNECT verb, so if httplib has
+                # concluded HTTP/0.9 is being used something has gone wrong.
+                cls.close()
+                raise socket.error("Invalid response from tunnel request")
+            if response.status != 200:
+                cls.close()
+                raise socket.error("Tunnel connection failed: %d %s" % (response.status,
+                                                                        response.reason))
+
+        if not hasattr(HTTPConnection, '_tunnel_real'):
+            HTTPConnection._tunnel_real = HTTPConnection._tunnel
+            HTTPConnection._tunnel_no_close = _tunnel_no_close
+            HTTPConnection._tunnel = _challenge_response_tunnel
+
     def __call__(self, r):
         # we must keep the connection because NTLM authenticates the
         # connection, not single requests
         r.headers["Connection"] = "Keep-Alive"
 
         r.register_hook('response', self.response_hook)
+        self._monkey_patch_httplib()
         return r
 
 
