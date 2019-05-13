@@ -1,13 +1,13 @@
 import binascii
 import sys
 import warnings
-import socket
 
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.exceptions import UnsupportedAlgorithm
-from httplib import HTTPConnection
+from http import HTTPStatus
+from http.client import HTTPConnection
 from ntlm_auth import ntlm
 from requests.auth import AuthBase
 from requests.packages.urllib3.response import HTTPResponse
@@ -142,7 +142,7 @@ class HttpNtlmAuth(AuthBase):
     def httplib_retry_using_http_NTLM_auth(self, auth_header_field, auth_header,
                                            connection, response, auth_type):
         """Attempt to authenticate using HTTP NTLM challenge/response."""
-        if auth_header in response.msg.dict:
+        if response.getheader(auth_header) is not None:
             return response
 
         # Consume content to allow our new request to reuse the same connection.
@@ -162,11 +162,11 @@ class HttpNtlmAuth(AuthBase):
         # this is important for some web applications that store
         # authentication-related info in cookies (it took a long time to
         # figure out)
-        if response2.msg.dict.get('set-cookie'):
-            connection._tunnel_headers['Cookie'] = response2.msg.dict.get('set-cookie')
+        if response2.getheader('set-cookie') is not None:
+            connection._tunnel_headers['Cookie'] = response2.getheader('set-cookie')
 
         # get the challenge
-        auth_header_value = response2.msg.dict[auth_header_field]
+        auth_header_value = response2.getheader(auth_header_field)
 
         auth_strip = auth_type + ' '
 
@@ -197,7 +197,7 @@ class HttpNtlmAuth(AuthBase):
 
     def response_hook(self, r, **kwargs):
         """The actual hook handler."""
-        if r.status_code == 401:
+        if r.status_code == HTTPStatus.UNAUTHORIZED:
             # Handle server auth.
             www_authenticate = r.headers.get('www-authenticate', '').lower()
             auth_type = _auth_type_from_header(www_authenticate)
@@ -210,7 +210,7 @@ class HttpNtlmAuth(AuthBase):
                     auth_type,
                     kwargs
                 )
-        elif r.status_code == 407:
+        elif r.status_code == HTTPStatus.PROXY_AUTHENTICATION_REQUIRED:
             # If we didn't have server auth, do proxy auth.
             proxy_authenticate = r.headers.get(
                 'proxy-authenticate', ''
@@ -229,9 +229,9 @@ class HttpNtlmAuth(AuthBase):
 
     def httplib_response_hook(self, conn, r):
         """The actual hook handler."""
-        if r.status == 401:
+        if r.status == HTTPStatus.UNAUTHORIZED:
             # Handle server auth.
-            www_authenticate = r.msg.dict.get('www-authenticate', '').lower()
+            www_authenticate = r.getheader('www-authenticate', default='').lower()
             auth_type = _auth_type_from_header(www_authenticate)
 
             if auth_type is not None:
@@ -242,11 +242,9 @@ class HttpNtlmAuth(AuthBase):
                     r,
                     auth_type
                 )
-        elif r.status == 407:
+        elif r.status == HTTPStatus.PROXY_AUTHENTICATION_REQUIRED:
             # If we didn't have server auth, do proxy auth.
-            proxy_authenticate = r.msg.dict.get(
-                'proxy-authenticate', ''
-            ).lower()
+            proxy_authenticate = r.getheader('proxy-authenticate', default='').lower()
             auth_type = _auth_type_from_header(proxy_authenticate)
             if auth_type is not None:
                 return self.httplib_retry_using_http_NTLM_auth(
@@ -297,13 +295,17 @@ class HttpNtlmAuth(AuthBase):
 
     def _monkey_patch_httplib(self):
         def _tunnel_no_close(cls):
-            cls.send("CONNECT %s:%d HTTP/1.0\r\n" % (cls._tunnel_host,
-                                                     cls._tunnel_port))
-            for header, value in cls._tunnel_headers.iteritems():
-                cls.send("%s: %s\r\n" % (header, value))
-            cls.send("\r\n")
-            response = cls.response_class(cls.sock, strict=cls.strict,
-                                          method=cls._method)
+            connect_str = "CONNECT %s:%d HTTP/1.0\r\n" % (cls._tunnel_host,
+                                                          cls._tunnel_port)
+            connect_bytes = connect_str.encode("ascii")
+            cls.send(connect_bytes)
+            for header, value in cls._tunnel_headers.items():
+                header_str = "%s: %s\r\n" % (header, value)
+                header_bytes = header_str.encode("latin-1")
+                cls.send(header_bytes)
+            cls.send(b'\r\n')
+
+            response = cls.response_class(cls.sock, method=cls._method)
             response.begin()
             return response
 
@@ -312,15 +314,10 @@ class HttpNtlmAuth(AuthBase):
             response = cls._tunnel_no_close()
             response = self.httplib_response_hook(cls, response)
 
-            if response.version == 9:
-                # HTTP/0.9 doesn't support the CONNECT verb, so if httplib has
-                # concluded HTTP/0.9 is being used something has gone wrong.
+            if response.status != HTTPStatus.OK:
                 cls.close()
-                raise socket.error("Invalid response from tunnel request")
-            if response.status != 200:
-                cls.close()
-                raise socket.error("Tunnel connection failed: %d %s" % (response.status,
-                                                                        response.reason))
+                raise OSError("Tunnel connection failed: %d %s" % (response.status,
+                                                                   response.reason))
 
         if not hasattr(HTTPConnection, '_tunnel_real'):
             HTTPConnection._tunnel_real = HTTPConnection._tunnel
